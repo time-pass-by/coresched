@@ -995,8 +995,63 @@ fn cmd_status() {
     .ok();
 }
 
-/// Cancel a job by JID.
-fn cmd_cancel(jid: &str) {
+/// Cancel one or more jobs, or all jobs.
+fn cmd_cancel(jids: &[String], all: bool) {
+    if all {
+        let counts = with_lock(|| -> (usize, usize, usize) {
+            let mut s = load_from_disk().unwrap_or_default();
+
+            let mut pids_to_kill: Vec<u32> = Vec::new();
+            for (_, entry) in s.pids.iter().chain(s.pending.iter()) {
+                if let Some(pid) = entry.pid {
+                    if pid > 0 {
+                        pids_to_kill.push(pid);
+                    }
+                }
+            }
+
+            let mut killed_count = 0;
+            for pid in &pids_to_kill {
+                if process::cancel_job(*pid).is_ok() {
+                    killed_count += 1;
+                }
+            }
+
+            let all_jids: Vec<String> = s
+                .pids
+                .keys()
+                .chain(s.pending.keys())
+                .map(|k| k.clone())
+                .collect();
+            let mut orphan_count = 0;
+            for jid in &all_jids {
+                scheduler::free_job(&mut s, jid);
+                s.pending.remove(jid);
+            }
+            orphan_count += all_jids.len().saturating_sub(killed_count);
+
+            let queued_count = s.queued.len();
+            s.queued.clear();
+
+            save_to_disk(&s).ok();
+            (killed_count, orphan_count, queued_count)
+        })
+        .unwrap_or((0, 0, 0));
+
+        println!(
+            "已取消全部: {} 运行中, {} 已清除, {} 从队列移除",
+            counts.0, counts.1, counts.2
+        );
+        return;
+    }
+
+    for jid in jids {
+        cancel_one(jid);
+    }
+}
+
+/// Cancel a single job by JID.
+fn cancel_one(jid: &str) {
     // Check queued first (no PID, just remove)
     let removed = with_lock(|| -> bool {
         let mut s = load_from_disk().unwrap_or_default();
@@ -1157,8 +1212,8 @@ fn main() {
             cmd_status();
             0
         }
-        Cli::Cancel { jid } => {
-            cmd_cancel(&jid);
+        Cli::Cancel { jids, all } => {
+            cmd_cancel(&jids, all);
             0
         }
         Cli::Wait { jid } => {

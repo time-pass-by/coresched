@@ -43,10 +43,15 @@ pub enum Cli {
     #[command(visible_alias = "st")]
     Status,
 
-    /// 取消作业
+    /// 取消作业 (可指定多个 JID，或 --all 取消全部)
     Cancel {
-        /// 作业 ID (如 j0001)
-        jid: String,
+        /// 作业 ID (可多个，如 j0001 j0002)
+        #[arg(value_name = "JID", required_unless_present = "all")]
+        jids: Vec<String>,
+
+        /// 取消所有作业（运行中 + 排队中）
+        #[arg(long, conflicts_with = "jids")]
+        all: bool,
     },
 
     /// 等待作业完成
@@ -253,7 +258,37 @@ mod tests {
         let args = Cli::try_parse_from(&["coresched", "cancel", "j0001"]);
         assert!(args.is_ok());
         match args.unwrap() {
-            Cli::Cancel { jid } => assert_eq!(jid, "j0001"),
+            Cli::Cancel { jids, all } => {
+                assert_eq!(jids, vec!["j0001"]);
+                assert!(!all);
+            }
+            _ => panic!("expected Cancel"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cancel_multiple() {
+        let args =
+            Cli::try_parse_from(&["coresched", "cancel", "j0001", "j0003", "j0007"]);
+        assert!(args.is_ok());
+        match args.unwrap() {
+            Cli::Cancel { jids, all } => {
+                assert_eq!(jids, vec!["j0001", "j0003", "j0007"]);
+                assert!(!all);
+            }
+            _ => panic!("expected Cancel"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cancel_all() {
+        let args = Cli::try_parse_from(&["coresched", "cancel", "--all"]);
+        assert!(args.is_ok());
+        match args.unwrap() {
+            Cli::Cancel { jids, all } => {
+                assert!(jids.is_empty());
+                assert!(all);
+            }
             _ => panic!("expected Cancel"),
         }
     }
