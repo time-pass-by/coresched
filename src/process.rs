@@ -6,7 +6,8 @@
 /// For `cmd_run`, we fork the process: the child handles allocation and
 /// execution while the parent returns immediately — maximizing throughput
 /// for OpenFOAM multi-case batch submission.
-use std::fs::OpenOptions;
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -83,28 +84,103 @@ pub fn wait_for_child(child: &mut Child) -> io::Result<i32> {
 }
 
 /// Kill a process by PID, with SIGTERM + graceful fallback to SIGKILL.
+///
+/// Scheduled commands are started as process-group leaders, but scientific
+/// runners may create additional sessions for timeout isolation.  Cancelling
+/// only the recorded leader would otherwise leave those descendants running
+/// after the scheduler frees their CPU allocation.  Snapshot the Linux
+/// process tree before signalling, then address both the inherited job group
+/// and descendant-owned groups.
 pub fn cancel_job(pid: u32) -> io::Result<()> {
-    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    let processes = collect_process_tree(pid);
+    let groups = job_process_groups(&processes);
 
-    // SIGTERM first
-    if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
-        if e != nix::errno::Errno::ESRCH {
-            return Err(io::Error::new(io::ErrorKind::Other, e));
-        }
-        return Ok(()); // already dead
-    }
+    signal_groups(&groups, nix::sys::signal::Signal::SIGTERM)?;
+    signal_processes(&processes, nix::sys::signal::Signal::SIGTERM)?;
 
-    // Small grace period (same as Python: sleep 0.2)
-    std::thread::sleep(Duration::from_millis(200));
+    // Give cooperative solvers and wrappers a brief opportunity to flush.
+    std::thread::sleep(Duration::from_millis(250));
 
-    // SIGKILL fallback
-    if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL) {
-        if e != nix::errno::Errno::ESRCH {
-            return Err(io::Error::new(io::ErrorKind::Other, e));
-        }
-    }
+    signal_groups(&groups, nix::sys::signal::Signal::SIGKILL)?;
+    signal_processes(&processes, nix::sys::signal::Signal::SIGKILL)?;
 
     Ok(())
+}
+
+/// Return a snapshot consisting of the root process and every currently
+/// reachable Linux child.  `/proc/.../children` is race-safe for cancellation:
+/// vanished children simply produce no further work, while the process-group
+/// snapshot still covers descendants that remain alive.
+fn collect_process_tree(root: u32) -> Vec<u32> {
+    let mut processes = vec![root];
+    let mut index = 0;
+    while index < processes.len() {
+        let pid = processes[index];
+        index += 1;
+        let path = format!("/proc/{pid}/task/{pid}/children");
+        let Ok(children) = fs::read_to_string(path) else {
+            continue;
+        };
+        for child in children
+            .split_whitespace()
+            .filter_map(|value| value.parse::<u32>().ok())
+        {
+            if child > 0 && !processes.contains(&child) {
+                processes.push(child);
+            }
+        }
+    }
+    processes
+}
+
+/// Every scheduled command is a group leader.  A descendant that calls
+/// `setsid()` becomes the leader of an additional group, which must also be
+/// signalled for cancellation to be complete.
+fn job_process_groups(processes: &[u32]) -> Vec<u32> {
+    let known: BTreeSet<i32> = processes.iter().map(|pid| *pid as i32).collect();
+    let mut groups = BTreeSet::new();
+    for pid in processes {
+        let process = nix::unistd::Pid::from_raw(*pid as i32);
+        if let Ok(group) = nix::unistd::getpgid(Some(process)) {
+            let group = group.as_raw();
+            if group > 0 && known.contains(&group) {
+                groups.insert(group as u32);
+            }
+        }
+    }
+    groups.into_iter().collect()
+}
+
+fn signal_groups(groups: &[u32], signal: nix::sys::signal::Signal) -> io::Result<()> {
+    for group in groups {
+        // A negative PID targets the whole process group on POSIX systems.
+        let target = nix::unistd::Pid::from_raw(-(*group as i32));
+        signal_target(target, signal)?;
+    }
+    Ok(())
+}
+
+fn signal_processes(processes: &[u32], signal: nix::sys::signal::Signal) -> io::Result<()> {
+    for pid in processes {
+        signal_target(nix::unistd::Pid::from_raw(*pid as i32), signal)?;
+    }
+    Ok(())
+}
+
+fn signal_target(target: nix::unistd::Pid, signal: nix::sys::signal::Signal) -> io::Result<()> {
+    match nix::sys::signal::kill(target, signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(io::Error::new(io::ErrorKind::Other, error)),
+    }
+}
+
+#[cfg(test)]
+fn process_group_alive(group: u32) -> bool {
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-(group as i32)), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(_) => true,
+    }
 }
 
 /// Check if a process is still alive.
@@ -116,6 +192,28 @@ pub fn is_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn wait_for_file_content(path: &Path) -> String {
+        for _ in 0..100 {
+            if let Ok(content) = fs::read_to_string(path) {
+                if !content.trim().is_empty() {
+                    return content;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    fn wait_for_group_exit(group: u32) {
+        for _ in 0..100 {
+            if !process_group_alive(group) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("process group {group} survived cancellation");
+    }
 
     #[test]
     fn test_is_alive_self() {
@@ -162,6 +260,65 @@ mod tests {
 
         let content = fs::read_to_string(&out).unwrap();
         assert_eq!(content, home);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_cancel_job_terminates_background_process_group() {
+        let dir = std::env::temp_dir().join(format!(
+            "coresched-test-cancel-group-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("cancel-group.out");
+        let mut child = spawn_detached(
+            "bash",
+            &["-c".to_string(), "sleep 30 & wait".to_string()],
+            &out,
+            &[],
+        )
+        .unwrap();
+        let group = child.id();
+
+        std::thread::sleep(Duration::from_millis(50));
+        cancel_job(group).unwrap();
+        let _ = child.wait();
+        wait_for_group_exit(group);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_cancel_job_terminates_descendant_new_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "coresched-test-cancel-session-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("cancel-session.out");
+        let mut child = spawn_detached(
+            "bash",
+            &[
+                "-c".to_string(),
+                "setsid sleep 30 & child=$!; printf '%s' \"$child\"; wait".to_string(),
+            ],
+            &out,
+            &[],
+        )
+        .unwrap();
+        let nested_pid: u32 = wait_for_file_content(&out).trim().parse().unwrap();
+        assert!(is_alive(nested_pid));
+
+        cancel_job(child.id()).unwrap();
+        let _ = child.wait();
+        for _ in 0..100 {
+            if !is_alive(nested_pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!is_alive(nested_pid));
 
         fs::remove_dir_all(&dir).ok();
     }
