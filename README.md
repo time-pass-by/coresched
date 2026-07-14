@@ -9,6 +9,7 @@ with CPU-pinning via `sched_setaffinity`.
 ## 特性 / Features
 
 - **纯 Rust / Pure Rust** — 无需 `taskset`、`task-spooler` 或 Python 运行时。
+- **自动拓扑探测 / Auto-detected topology** — 启动时从 `/sys` 读取物理核、SMT 兄弟关系，任意核数机器开箱即用。
 - **优先级队列 / Priority-aware queue** (P0/P1/P2) — 标定任务优先于扫描任务；高优先级任务可独占指定物理核心。
 - **异步提交 / Fork/exec model** — `run` 立即返回；子进程等待资源、分配核心、绑定并异步运行。
 - **持久化入队 / Durable enqueue** — `enqueue` 写入持久化队列，进程重启不丢失；调度器在核心释放时自动派发。
@@ -71,6 +72,19 @@ coresched (Rust binary)
 
 State is stored at `~/.coresched/state.json`. The JSON schema is
 backward-compatible with the original Bash/Python version.
+
+## 拓扑自动探测 / Topology auto-detection
+
+启动时从 `/sys/devices/system/cpu/cpuN/topology/` 读取 `core_id` 和
+`physical_package_id`，自动分组得到物理核和 SMT 兄弟线程。无论 4 核笔记本还是
+128 核服务器，同一个二进制文件直接运行。
+
+At startup, `coresched` reads `core_id` / `physical_package_id` from
+`/sys/devices/system/cpu/cpuN/topology/` to discover physical cores and SMT
+siblings. The same binary runs on any machine — 4 cores or 128.
+
+- `/sys` 不可读时降级为 `available_parallelism()`，假设无 SMT。
+- 从原 Bash/Python 版迁移时，旧 `state.json` 的 cfd/cpus map 自动补齐或裁剪到当前核心数，`reserved_cores` 自动校验合法性，无需手动清理。
 
 ## 优先级与核心保留 / Priority & Core Reservation
 
