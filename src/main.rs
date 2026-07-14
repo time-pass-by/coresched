@@ -869,36 +869,6 @@ fn cmd_status() {
             cpus_chars[..8].iter().collect::<String>(),
             cpus_chars[8..].iter().collect::<String>(),
         );
-        let priority_one_capacity = scheduler::eligible_cpus(&s, JobPriority::P1).len();
-        let priority_two_cpus = scheduler::eligible_cpus(&s, JobPriority::P2);
-        let priority_two_capacity = priority_two_cpus.len();
-        if !reserved_cores.is_empty() {
-            let reserved_description = reserved_cores
-                .iter()
-                .map(|&core| {
-                    let (first, second) = topology::logical_cpus(core).unwrap();
-                    format!("Core {} ({},{})", core, first, second)
-                })
-                .collect::<Vec<_>>()
-                .join("；");
-            println!(
-                "         P0/P1 上限: {} 逻辑CPU；P2 上限: {}；P2 优先: {}；H = {} 的 P2 专用逻辑CPU",
-                priority_one_capacity,
-                priority_two_capacity,
-                priority_two_cpus
-                    .iter()
-                    .take(reserved_cores.len() * 2)
-                    .map(u8::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-                reserved_description
-            );
-        } else {
-            println!(
-                "         --cpus 可调度上限: {} 逻辑CPU；· 表示保留给物理核/系统",
-                priority_one_capacity
-            );
-        }
         println!();
 
         // Running jobs
