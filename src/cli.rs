@@ -43,9 +43,12 @@ pub enum Cli {
     #[command(visible_alias = "st")]
     Status,
 
-    /// 取消作业 (可指定多个 JID，或 --all 取消全部)
+    /// 取消作业：支持单个、多个、或全部取消。
+    #[command(
+        after_help = "示例:\n  coresched cancel j0001\n  coresched cancel j0001 j0003\n  coresched cancel --all"
+    )]
     Cancel {
-        /// 作业 ID (可多个，如 j0001 j0002)
+        /// 作业 JID，可一次指定多个
         #[arg(value_name = "JID", required_unless_present = "all")]
         jids: Vec<String>,
 
