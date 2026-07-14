@@ -8,7 +8,7 @@ use clap::Parser;
     about = "CPU core scheduler for Legend",
     version,
     disable_help_subcommand = true,
-    after_help = "优先级: --priority 0（默认）、1、2；队列按 2→1→0 派发。\n保留核: 默认 Core 6、7（逻辑 CPU 6,14,7,15）仅允许优先级 2 使用；P2 逻辑 CPU 优先顺序为 6,7,14,15。\n调整: coresched reserve-core 6 7；清除: coresched reserve-core --clear。"
+    after_help = "优先级: --priority 0（默认）、1、2、3；队列按 3→2→1→0 派发。\n保留核: 最后一个物理核仅 P3 可用，倒数第二个仅 P2+ 可用。\n调整: coresched reserve-core <核心号>；清除: coresched reserve-core --clear。"
 )]
 pub enum Cli {
     /// 提交作业并绑定 CPU 核心
@@ -22,7 +22,7 @@ pub enum Cli {
         #[arg(long, conflicts_with = "cfd", value_name = "N")]
         cpus: Option<u8>,
 
-        /// 优先级: 0(默认)、1、2
+        /// 优先级: 0(默认)、1、2、3
         #[arg(long, default_value_t = JobPriority::P0, value_name = "LEVEL")]
         priority: JobPriority,
 
@@ -80,7 +80,7 @@ pub enum Cli {
         #[arg(long, conflicts_with = "cfd", value_name = "N")]
         cpus: Option<u8>,
 
-        /// 优先级: 0(默认)、1、2
+        /// 优先级: 0(默认)、1、2、3
         #[arg(long, default_value_t = JobPriority::P0, value_name = "LEVEL")]
         priority: JobPriority,
 
@@ -89,7 +89,7 @@ pub enum Cli {
         command: Vec<String>,
     },
 
-    /// 保留一个或多个物理核，仅允许优先级 2 的任务使用
+    /// 保留一个或多个物理核，仅允许 P2+ 使用
     #[command(visible_alias = "reserve")]
     ReserveCore {
         /// 物理核编号 (0-7)，可一次指定多个
@@ -240,6 +240,7 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--priority 0（默认）、1、2"));
         assert!(help.contains("reserve-core"));
+        assert!(help.contains("P3"));
     }
 
     #[test]

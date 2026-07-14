@@ -147,14 +147,14 @@ pub fn num_logical_cpus() -> usize {
     get().all_cpus.len()
 }
 
-/// Reserve fraction of cores by default: the last max(0, ⌈N/4⌉) physical cores
-/// when N >= 4, otherwise none.
+/// Reserve the last 2 cores for priority 2 & 3 (when N >= 2),
+/// or the last 1 core when N == 1.
 pub fn default_reserved_cores() -> Vec<u8> {
     let n = num_physical_cores();
-    if n < 4 {
+    if n == 0 {
         return Vec::new();
     }
-    let keep = ((n + 3) / 4).max(1).min(n);
+    let keep = if n >= 2 { 2 } else { 1 };
     ((n - keep) as u8..n as u8).collect()
 }
 
@@ -201,9 +201,12 @@ mod tests {
     fn test_default_reserved_cores_reasonable() {
         let reserved = default_reserved_cores();
         let total = num_physical_cores();
-        if total >= 4 {
-            assert!(!reserved.is_empty());
-            assert!(reserved.len() <= total);
+        if total >= 2 {
+            assert_eq!(reserved.len(), 2);
+            assert_eq!(reserved[0], total as u8 - 2);
+            assert_eq!(reserved[1], total as u8 - 1);
+        } else if total == 1 {
+            assert_eq!(reserved, vec![0]);
         }
     }
 }

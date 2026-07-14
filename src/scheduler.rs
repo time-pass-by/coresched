@@ -1,6 +1,9 @@
 /// CPU scheduling engine.
 ///
-/// Implements the same allocation policies as the original Python version:
+/// Allocation policies with per-priority exclusivity:
+/// - P3: exclusive access to the last physical core, can also use all others
+/// - P2: exclusive access to the second-to-last core, can also use shared pool
+/// - P1/P0: only use shared pool (excluded from the last 2 cores)
 /// - `cfd`: allocate whole physical cores (both hyperthreads)
 /// - `py`: allocate individual logical CPUs
 use crate::state::save_to_disk;
@@ -10,46 +13,68 @@ use nix::sys::signal::kill;
 use nix::unistd::Pid;
 use std::time::SystemTime;
 
-pub fn reserved_physical_cores(state: &CoreschedState) -> Vec<u8> {
-    state
-        .reserved_cores()
-        .into_iter()
-        .filter(|&core| topology::logical_cpus(core).is_some())
-        .collect()
+/// The physical core that `priority` has EXCLUSIVE access to (only that
+/// priority level can use it). Returns None if the machine is too small.
+pub fn priority_exclusive_core(priority: JobPriority) -> Option<u8> {
+    let total = topology::num_physical_cores() as u8;
+    match priority {
+        JobPriority::P3 if total >= 1 => Some(total - 1),
+        JobPriority::P2 if total >= 2 => Some(total - 2),
+        _ => None,
+    }
 }
 
-fn cpu_belongs_to_core(cpu: u8, core: u8) -> bool {
-    topology::logical_cpus(core)
-        .map(|(first, second)| cpu == first || cpu == second)
-        .unwrap_or(false)
+/// Physical cores forbidden for `priority` (reserved by strictly higher
+/// levels).
+fn forbidden_cores(priority: JobPriority) -> Vec<u8> {
+    match priority {
+        JobPriority::P3 => vec![],
+        JobPriority::P2 => priority_exclusive_core(JobPriority::P3)
+            .into_iter()
+            .collect(),
+        _ => [
+            JobPriority::P3,
+            JobPriority::P2,
+        ]
+        .iter()
+        .filter_map(|&p| priority_exclusive_core(p))
+        .collect(),
+    }
 }
 
-/// CPUs a job priority is allowed to use. Priority 2 jobs prefer all reserved
-/// physical-core pairs, while priorities 0 and 1 never receive those pairs.
-pub fn eligible_cpus(state: &CoreschedState, priority: JobPriority) -> Vec<u8> {
-    let reserved = reserved_physical_cores(state);
+/// Logical CPUs forbidden for `priority` (belonging to cores reserved by
+/// strictly higher levels).
+fn forbidden_cpus(priority: JobPriority) -> Vec<u8> {
+    let mut cpus = Vec::new();
+    for core in forbidden_cores(priority) {
+        if let Some((a, b)) = topology::logical_cpus(core) {
+            cpus.push(a);
+            if b != a {
+                cpus.push(b);
+            }
+        }
+    }
+    cpus
+}
+
+/// CPUs a job priority is allowed to use, with per-priority exclusivity.
+pub fn eligible_cpus(_state: &CoreschedState, priority: JobPriority) -> Vec<u8> {
     let mut cpus = Vec::new();
 
-    if priority == JobPriority::P2 {
-        for core in &reserved {
-            let (first, _) = topology::logical_cpus(*core).unwrap();
+    // Own exclusive core's CPUs first
+    if let Some(core) = priority_exclusive_core(priority) {
+        if let Some((first, second)) = topology::logical_cpus(core) {
             cpus.push(first);
-        }
-        for core in &reserved {
-            let (first, second) = topology::logical_cpus(*core).unwrap();
             if second != first {
                 cpus.push(second);
             }
         }
     }
 
+    // Then shared pool (exclude higher-priority-exclusive CPUs)
+    let forbidden = forbidden_cpus(priority);
     for cpu in topology::schedulable_cpus() {
-        if priority != JobPriority::P2
-            && reserved.iter().any(|&core| cpu_belongs_to_core(cpu, core))
-        {
-            continue;
-        }
-        if !cpus.contains(&cpu) {
+        if !forbidden.contains(&cpu) && !cpus.contains(&cpu) {
             cpus.push(cpu);
         }
     }
@@ -57,23 +82,33 @@ pub fn eligible_cpus(state: &CoreschedState, priority: JobPriority) -> Vec<u8> {
     cpus
 }
 
-/// Physical cores a job priority is allowed to use. Priority 2 jobs prefer the
-/// reserved cores; priorities 0 and 1 never see them.
-pub fn eligible_physical_cores(state: &CoreschedState, priority: JobPriority) -> Vec<u8> {
-    let reserved = reserved_physical_cores(state);
+/// Physical cores a job priority is allowed to use, with per-priority
+/// exclusivity.
+pub fn eligible_physical_cores(_state: &CoreschedState, priority: JobPriority) -> Vec<u8> {
     let mut cores = Vec::new();
 
-    if priority == JobPriority::P2 {
-        cores.extend(reserved.iter().copied());
+    // Own exclusive core first
+    if let Some(core) = priority_exclusive_core(priority) {
+        cores.push(core);
     }
 
+    // Then shared pool (exclude higher-priority-exclusive cores)
+    let forbidden = forbidden_cores(priority);
     for core in topology::physical_cores() {
-        if !reserved.contains(&core) {
+        if !forbidden.contains(&core) && !cores.contains(&core) {
             cores.push(core);
         }
     }
 
     cores
+}
+
+pub fn reserved_physical_cores(state: &CoreschedState) -> Vec<u8> {
+    state
+        .reserved_cores()
+        .into_iter()
+        .filter(|&core| topology::logical_cpus(core).is_some())
+        .collect()
 }
 
 fn physical_core_is_free(state: &CoreschedState, core: u8) -> bool {
@@ -273,10 +308,10 @@ pub fn has_higher_priority_waiting(
         || state.queued.iter().any(|entry| entry.priority > priority)
 }
 
-/// Return the next queue entry under strict 2 -> 1 -> 0 ordering. Jobs retain
+/// Return the next queue entry under strict 3 -> 2 -> 1 -> 0 ordering. Jobs retain
 /// FIFO order within a level and yield to a waiting direct `run` at a higher level.
 pub fn next_queued_job_index(state: &CoreschedState) -> Option<usize> {
-    for priority in [JobPriority::P2, JobPriority::P1, JobPriority::P0] {
+    for priority in [JobPriority::P3, JobPriority::P2, JobPriority::P1, JobPriority::P0] {
         if let Some(index) = state
             .queued
             .iter()
@@ -408,10 +443,18 @@ mod tests {
     }
 
     #[test]
-    fn test_alloc_cfd_exhausted() {
+    fn test_alloc_cfd_exhausted_p2() {
         let mut s = fresh_state();
+        // P2 cannot use the last core (P3-exclusive), so only 7 cores.
         let cores = alloc_cfd_for_priority(&mut s, 10, JobPriority::P2);
-        assert_eq!(cores.len(), 8); // only 8 physical cores
+        assert_eq!(cores.len(), 7);
+    }
+
+    #[test]
+    fn test_alloc_cfd_exhausted_p3() {
+        let mut s = fresh_state();
+        let cores = alloc_cfd_for_priority(&mut s, 10, JobPriority::P3);
+        assert_eq!(cores.len(), 8); // P3 can use all
     }
 
     #[test]
@@ -425,9 +468,8 @@ mod tests {
     #[test]
     fn test_cfd_then_py_no_overlap() {
         let mut s = fresh_state();
-        alloc_cfd_for_priority(&mut s, 1, JobPriority::P1); // takes physical core 0 → logical 0,8
+        alloc_cfd_for_priority(&mut s, 1, JobPriority::P1);
         let py = alloc_py_for_priority(&mut s, 2, JobPriority::P1);
-        // py should get CPU 1 and 2 (0 and 8 are taken)
         assert_eq!(py, vec![1, 2]);
     }
 
@@ -463,21 +505,24 @@ mod tests {
     fn test_needed_for() {
         let mut s = fresh_state();
         alloc_cfd_for_priority(&mut s, 6, JobPriority::P2);
-        // 8 total cores, 6 allocated → 2 free
-        assert_eq!(needed_for_priority(&s, "cfd", 8, JobPriority::P2), 6); // need 6 more
-        assert_eq!(needed_for_priority(&s, "cfd", 4, JobPriority::P2), 2); // need 2 more
-        assert_eq!(needed_for_priority(&s, "cfd", 2, JobPriority::P2), 0); // already enough
+        // P2 eligible: core 6 first, then [0..5] = 7 total.
+        // 6 allocated → 1 free (core 5).
+        assert_eq!(needed_for_priority(&s, "cfd", 8, JobPriority::P2), 7);
+        assert_eq!(needed_for_priority(&s, "cfd", 4, JobPriority::P2), 3);
+        assert_eq!(needed_for_priority(&s, "cfd", 2, JobPriority::P2), 1);
+        assert_eq!(needed_for_priority(&s, "cfd", 1, JobPriority::P2), 0);
     }
 
     #[test]
     fn test_reserved_cores_are_excluded_from_priority_zero_and_one_jobs() {
         let mut s = fresh_state();
-        s.set_reserved_cores(vec![6, 7]);
 
+        // P0/P1 cannot use core 6 (P2) or core 7 (P3).
         assert_eq!(
             eligible_physical_cores(&s, JobPriority::P1),
             vec![0, 1, 2, 3, 4, 5]
         );
+        // P0/P1 py limit on 8-core: 12 CPUs (0-5, 8-13)
         assert_eq!(needed_for_priority(&s, "py", 12, JobPriority::P1), 0);
 
         let priority_one_cpus = alloc_py_for_priority(&mut s, 12, JobPriority::P1);
@@ -488,7 +533,6 @@ mod tests {
         assert!(!priority_one_cpus.contains(&15));
 
         let mut s = fresh_state();
-        s.set_reserved_cores(vec![6, 7]);
         let priority_zero_cpus = alloc_py_for_priority(&mut s, 12, JobPriority::P0);
         assert!(!priority_zero_cpus.contains(&6));
         assert!(!priority_zero_cpus.contains(&7));
@@ -497,21 +541,48 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_two_prefers_reserved_cpu_and_cfd_core_orders() {
+    fn test_p2_prefers_own_exclusive_core_only() {
         let mut s = fresh_state();
-        s.set_reserved_cores(vec![6, 7]);
-
-        assert_eq!(
-            alloc_py_for_priority(&mut s, 4, JobPriority::P2),
-            vec![6, 7, 14, 15]
-        );
-
-        let mut s = fresh_state();
-        s.set_reserved_cores(vec![6, 7]);
+        // P2 gets core 6 first (its exclusive core), NOT core 7 (P3's).
         assert_eq!(
             alloc_cfd_for_priority(&mut s, 2, JobPriority::P2),
-            vec![6, 7]
+            vec![6, 0]
         );
+
+        let mut s = fresh_state();
+        // P2 py: get CPUs of core 6 first (6, 14), then shared pool.
+        assert_eq!(
+            alloc_py_for_priority(&mut s, 4, JobPriority::P2),
+            vec![6, 14, 0, 1]
+        );
+    }
+
+    #[test]
+    fn test_p3_gets_last_core_exclusively() {
+        let mut s = fresh_state();
+        // P3 cfd: gets core 7 first (its exclusive core).
+        assert_eq!(
+            alloc_cfd_for_priority(&mut s, 2, JobPriority::P3),
+            vec![7, 0]
+        );
+
+        let mut s = fresh_state();
+        // P3 py: gets CPUs of core 7 first (7, 15), then shared pool.
+        assert_eq!(
+            alloc_py_for_priority(&mut s, 4, JobPriority::P3),
+            vec![7, 15, 0, 1]
+        );
+    }
+
+    #[test]
+    fn test_p3_no_interference_from_p2() {
+        // P3 has access to all 8 cores. P2 sees only 7.
+        let s = fresh_state();
+        let p3_eligible = eligible_physical_cores(&s, JobPriority::P3);
+        let p2_eligible = eligible_physical_cores(&s, JobPriority::P2);
+        assert_eq!(p3_eligible.len(), 8);
+        assert_eq!(p2_eligible.len(), 7);
+        assert!(!p2_eligible.contains(&(topology::num_physical_cores() as u8 - 1)));
     }
 
     #[test]
@@ -539,20 +610,38 @@ mod tests {
     }
 
     #[test]
-    fn test_queued_priority_two_precedes_lower_levels() {
+    fn test_queued_priority_order_p3_first() {
         let mut s = fresh_state();
         s.queued.push_back(queued_job("j0001", JobPriority::P0));
         s.queued.push_back(queued_job("j0002", JobPriority::P1));
         s.queued.push_back(queued_job("j0003", JobPriority::P2));
-        assert_eq!(next_queued_job_index(&s), Some(2));
+        s.queued.push_back(queued_job("j0004", JobPriority::P3));
+        assert_eq!(next_queued_job_index(&s), Some(3)); // P3 first
     }
 
     #[test]
     fn test_waiting_higher_priority_run_blocks_lower_queue_dispatch() {
         let mut s = fresh_state();
         s.pending
-            .insert("j0001".to_string(), queued_job("j0001", JobPriority::P2));
-        s.queued.push_back(queued_job("j0002", JobPriority::P1));
+            .insert("j0001".to_string(), queued_job("j0001", JobPriority::P3));
+        s.queued.push_back(queued_job("j0002", JobPriority::P2));
         assert_eq!(next_queued_job_index(&s), None);
+    }
+
+    #[test]
+    fn test_forbidden_cores() {
+        let total = topology::num_physical_cores() as u8;
+        // P3: nothing forbidden
+        assert!(forbidden_cores(JobPriority::P3).is_empty());
+        // P2: P3's exclusive core forbidden
+        if total >= 1 {
+            assert_eq!(forbidden_cores(JobPriority::P2), vec![total - 1]);
+        }
+        // P0/P1: both P3's and P2's exclusive cores forbidden
+        if total >= 2 {
+            let mut f = forbidden_cores(JobPriority::P0);
+            f.sort();
+            assert_eq!(f, vec![total - 2, total - 1]);
+        }
     }
 }

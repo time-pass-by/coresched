@@ -24,6 +24,8 @@ pub enum JobPriority {
     P1,
     #[serde(rename = "2", alias = "high")]
     P2,
+    #[serde(rename = "3", alias = "critical")]
+    P3,
 }
 
 pub fn default_reserved_physical_cores() -> Vec<u8> {
@@ -83,6 +85,7 @@ impl JobPriority {
             Self::P0 => "0",
             Self::P1 => "1",
             Self::P2 => "2",
+            Self::P3 => "3",
         }
     }
 }
@@ -101,7 +104,8 @@ impl FromStr for JobPriority {
             "0" => Ok(Self::P0),
             "1" => Ok(Self::P1),
             "2" => Ok(Self::P2),
-            _ => Err("priority must be 0, 1, or 2".to_string()),
+            "3" => Ok(Self::P3),
+            _ => Err("priority must be 0, 1, 2, or 3".to_string()),
         }
     }
 }
@@ -397,6 +401,7 @@ mod tests {
 
     #[test]
     fn test_priority_serializes_as_numeric_and_accepts_previous_labels() {
+        assert_eq!(serde_json::to_string(&JobPriority::P3).unwrap(), "\"3\"");
         assert_eq!(serde_json::to_string(&JobPriority::P2).unwrap(), "\"2\"");
         assert_eq!(
             serde_json::from_str::<JobPriority>("\"normal\"").unwrap(),
@@ -405,6 +410,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<JobPriority>("\"high\"").unwrap(),
             JobPriority::P2
+        );
+        assert_eq!(
+            serde_json::from_str::<JobPriority>("\"critical\"").unwrap(),
+            JobPriority::P3
         );
     }
 }

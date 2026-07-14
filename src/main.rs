@@ -805,7 +805,8 @@ fn cmd_status() {
         // dispatcher allocates the next queued job.
         let s = load_from_disk().unwrap_or_default();
 
-        let reserved_cores = scheduler::reserved_physical_cores(&s);
+        let p3_core = scheduler::priority_exclusive_core(JobPriority::P3);
+        let p2_core = scheduler::priority_exclusive_core(JobPriority::P2);
 
         println!("\n{:^8} {:^8} {:^12} {}", "物理核", "类型", "CPUs", "策略");
         println!("{}", "-".repeat(48));
@@ -830,7 +831,9 @@ fn cmd_status() {
             } else {
                 "空闲"
             };
-            let policy = if reserved_cores.contains(&c) {
+            let policy = if Some(c) == p3_core {
+                "仅 P3"
+            } else if Some(c) == p2_core {
                 "仅 P2"
             } else {
                 ""
@@ -846,16 +849,26 @@ fn cmd_status() {
 
         println!();
         let mut cpus_status = String::new();
+        let p3_cpus: Vec<u8> = p3_core
+            .map(|core| {
+                let (a, b) = topology::logical_cpus(core).unwrap();
+                if a == b { vec![a] } else { vec![a, b] }
+            })
+            .unwrap_or_default();
+        let p2_cpus: Vec<u8> = p2_core
+            .map(|core| {
+                let (a, b) = topology::logical_cpus(core).unwrap();
+                if a == b { vec![a] } else { vec![a, b] }
+            })
+            .unwrap_or_default();
         for c in topology::all_cpus() {
             let v = s.cpus.get(&c.to_string()).copied().unwrap_or(None);
-            let high_only = reserved_cores.iter().any(|&core| {
-                let (first, second) = topology::logical_cpus(core).unwrap();
-                c == first || c == second
-            });
             cpus_status.push(if v.is_some() {
                 '█'
-            } else if high_only {
-                'H'
+            } else if p3_cpus.contains(&c) {
+                '3'
+            } else if p2_cpus.contains(&c) {
+                '2'
             } else if topology::is_schedulable_cpu(c) {
                 '░'
             } else {
