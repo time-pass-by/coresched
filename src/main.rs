@@ -521,7 +521,10 @@ fn cmd_reserve_core(cores: Vec<u8>, clear: bool) -> i32 {
             .iter()
             .any(|&core| topology::logical_cpus(core).is_none())
     {
-        eprintln!("coresched: 物理核必须在 0-7 范围内");
+        eprintln!(
+            "coresched: 物理核必须在 0-{} 范围内",
+            topology::num_physical_cores().saturating_sub(1)
+        );
         return 1;
     }
     let mut requested = Vec::new();

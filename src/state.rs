@@ -26,18 +26,15 @@ pub enum JobPriority {
     P2,
 }
 
-/// Physical cores reserved for priority 2 by default. Their logical CPU pairs
-/// are Core 6 -> (6,14) and Core 7 -> (7,15), in priority order.
-pub const DEFAULT_PRIORITY_RESERVED_CORES: &[u8] = &[6, 7];
-
 pub fn default_reserved_physical_cores() -> Vec<u8> {
-    DEFAULT_PRIORITY_RESERVED_CORES.to_vec()
+    crate::topology::default_reserved_cores()
 }
 
 fn normalize_reserved_physical_cores(cores: Vec<u8>) -> Vec<u8> {
+    let max_core = crate::topology::num_physical_cores() as u8;
     let mut normalized = Vec::new();
     for core in cores {
-        if core < 8 && !normalized.contains(&core) {
+        if core < max_core && !normalized.contains(&core) {
             normalized.push(core);
         }
     }
@@ -155,12 +152,15 @@ pub struct CoreschedState {
 
 impl Default for CoreschedState {
     fn default() -> Self {
+        let total_cores = crate::topology::num_physical_cores() as u8;
+        let total_cpus = crate::topology::num_logical_cpus() as u8;
+
         let mut cfd = HashMap::new();
-        let mut cpus = HashMap::new();
-        for c in 0..8 {
+        for c in 0..total_cores {
             cfd.insert(c.to_string(), false);
         }
-        for c in 0..16 {
+        let mut cpus = HashMap::new();
+        for c in 0..total_cpus {
             cpus.insert(c.to_string(), None);
         }
         Self {
@@ -176,6 +176,20 @@ impl Default for CoreschedState {
 }
 
 impl CoreschedState {
+    /// Ensure cfd/cpus maps cover the current topology, filling any gaps.
+    pub fn migrate(&mut self) {
+        let total_cores = crate::topology::num_physical_cores() as u8;
+        let total_cpus = crate::topology::num_logical_cpus() as u8;
+        for c in 0..total_cores {
+            self.cfd.entry(c.to_string()).or_insert(false);
+        }
+        for c in 0..total_cpus {
+            self.cpus.entry(c.to_string()).or_insert(None);
+        }
+        self.reserved_physical_cores = normalize_reserved_physical_cores(
+            std::mem::take(&mut self.reserved_physical_cores),
+        );
+    }
     pub fn reserved_cores(&self) -> Vec<u8> {
         normalize_reserved_physical_cores(self.reserved_physical_cores.clone())
     }
@@ -250,10 +264,12 @@ pub fn init() -> io::Result<()> {
 }
 
 /// Load state from disk (caller must hold lock).
+/// Automatically migrates old state files to the current topology.
 pub fn load_from_disk() -> io::Result<CoreschedState> {
     let data = fs::read_to_string(state_path())?;
-    let s: CoreschedState =
+    let mut s: CoreschedState =
         serde_json::from_str(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    s.migrate();
     Ok(s)
 }
 
@@ -303,12 +319,17 @@ mod tests {
     #[test]
     fn test_default_state() {
         let s = CoreschedState::default();
-        assert_eq!(s.cfd.len(), 8);
+        let expected_cores = crate::topology::num_physical_cores();
+        let expected_cpus = crate::topology::num_logical_cpus();
+        assert_eq!(s.cfd.len(), expected_cores);
         assert!(s.cfd.values().all(|v| !v));
-        assert_eq!(s.cpus.len(), 16);
+        assert_eq!(s.cpus.len(), expected_cpus);
         assert!(s.cpus.values().all(|v| v.is_none()));
         assert_eq!(s.next_jid, 1);
-        assert_eq!(s.reserved_cores(), vec![6, 7]);
+        assert_eq!(
+            s.reserved_cores(),
+            crate::topology::default_reserved_cores()
+        );
     }
 
     #[test]
@@ -343,7 +364,10 @@ mod tests {
     fn test_legacy_empty_reservation_adopts_configured_default() {
         let state: CoreschedState =
             serde_json::from_str(r#"{"reserved_physical_core":null,"next":1}"#).unwrap();
-        assert_eq!(state.reserved_cores(), vec![6, 7]);
+        assert_eq!(
+            state.reserved_cores(),
+            crate::topology::default_reserved_cores()
+        );
     }
 
     #[test]

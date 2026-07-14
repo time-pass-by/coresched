@@ -231,7 +231,7 @@ mod tests {
     fn test_top_level_help_describes_priority_and_reservation() {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--priority 0（默认）、1、2"));
-        assert!(help.contains("reserve-core 6 7"));
+        assert!(help.contains("reserve-core"));
     }
 
     #[test]
